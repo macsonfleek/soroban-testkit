@@ -2051,6 +2051,7 @@ dependencies = [
  "soroban-env-host",
  "soroban-sdk",
  "soroban-testkit-core",
+ "stellar-strkey 0.0.16",
 ]
 
 [[package]]

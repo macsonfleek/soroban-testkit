@@ -19,6 +19,12 @@ Soroban-aware property-testing strategies for `proptest`, so generated inputs re
 | `account_address()` | `AddressBytes` | an ed25519 account (`G...`) |
 | `contract_address()` | `AddressBytes` | a contract id (`C...`) |
 | `address_of_type(kind)` | `AddressBytes` | the format you ask for |
+| `sc_address()` | `ScAddress` | a raw XDR account or contract address |
+| `sc_account_address()` | `ScAddress` | `ScAddress::Account` with an ed25519 key |
+| `sc_contract_address()` | `ScAddress` | `ScAddress::Contract` with a 32-byte hash |
+| `sc_muxed_account_address()` | `ScAddress` | `ScAddress::MuxedAccount` with a key and a 64-bit id |
+| `sc_address_collection(len)` | `Vec<ScAddress>` | mixed account, contract and muxed addresses |
+| `muxed_address()` | `MuxedAddress` | a muxed ed25519 account: `M...` strkey plus its `G...` form |
 | `fuzzed_invocation_args(env, typed, max_rogue)` | `Vec<Val>` | valid arguments mixed with integers, booleans, symbols, errors, and address objects |
 | `host_error_code_coverage()` | `HostError` | all 10 categories × all 10 codes |
 | `host_error()` | `HostError` | alias for `host_error_code_coverage()` |
@@ -117,6 +123,105 @@ proptest! {
   <span class="tk-callout__title">No duplicates by construction</span>
   <p>Each generated address carries a process-wide nonce, so two calls to <code>address()</code> in the same test run never produce the same bytes — even if their random prefixes collide. The trade-off is that values depend on generation order, so a failing case should be judged by the bytes proptest prints rather than by replaying a random seed alone.</p>
 </div>
+
+## Raw XDR addresses, muxed accounts and strkeys
+
+A contract call takes an `Address`, but the ledger stores an `ScAddress`, and
+the two are not the same value: an `Address` is a host handle owned by an
+`Env`, while `ScAddress` is the XDR union. Low-level tests — decoding a ledger
+entry, writing a parser for the account and contract arms, checking what a
+contract makes of an address a caller could never build through the SDK — need
+the encoded form. `sc_address()` generates it, and the two named arms generate
+one variant each:
+
+```rust
+use proptest::prelude::*;
+use soroban_sdk::xdr::{AccountId, PublicKey, ScAddress, Uint256};
+use soroban_testkit_generators::strategies::{sc_address, sc_contract_address};
+
+proptest! {
+    #[test]
+    fn a_decoder_never_confuses_the_two_kinds(address in sc_address()) {
+        match address {
+            ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(key)))) => {
+                assert_eq!(key.len(), 32);
+            }
+            ScAddress::Contract(_) => {}
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn a_contract_id_keeps_its_hash(contract in sc_contract_address()) {
+        assert!(matches!(contract, ScAddress::Contract(_)));
+    }
+}
+```
+
+Both arms shrink towards the zeroed 32-byte payload, so a failing contract id
+minimises to the all-zero hash and a failing account to the all-zero key. The
+strategies generate the payload directly rather than splicing in a uniqueness
+nonce (unlike `address()`), because a shrinking strategy has to be able to
+simplify every byte.
+
+### Muxed accounts
+
+A muxed account is an ed25519 key plus a 64-bit id, which Stellar renders as an
+`M...` strkey. `sc_muxed_account_address()` generates the
+`ScAddress::MuxedAccount` XDR variant, and `muxed_address()` generates the two
+parts as a `MuxedAddress` so a test can check what happens to the id:
+
+```rust
+use proptest::prelude::*;
+use soroban_testkit_generators::strategies::muxed_address;
+
+proptest! {
+    #[test]
+    fn a_muxed_address_survives_its_strkey(muxed in muxed_address()) {
+        let strkey = muxed.to_strkey();          // M...
+        assert!(strkey.starts_with('M'));
+        assert_eq!(
+            soroban_testkit_generators::strategies::MuxedAddress::from_strkey(&strkey),
+            Some(muxed),
+        );
+        assert!(muxed.account_strkey().starts_with('G'));
+    }
+}
+```
+
+`MuxedAddress::to_sc_address()` keeps both parts as `ScAddress::MuxedAccount`;
+`to_account_sc_address()` drops the id; `to_address(&env)` rebuilds the
+underlying account as the host `Address` a contract takes; `to_muxed_account()`
+returns the classic XDR `MuxedAccount`; and `id()`, `ed25519()` and `account()`
+read the parts back out. The key and the id both shrink towards zero.
+
+### Strkeys without a host `Address`
+
+An `AddressBytes` converts to its strkey and back, which is what makes a test
+able to compare a generated value against the string a user sees, or to
+reconstruct one from a fixture:
+
+```rust
+use proptest::prelude::*;
+use soroban_testkit_generators::strategies::{account_address, AddressBytes, AddressType};
+
+proptest! {
+    #[test]
+    fn an_account_strkey_round_trips(address in account_address()) {
+        let parsed = AddressBytes::from_strkey(&address.to_strkey()).unwrap();
+        assert_eq!(parsed.address_type(), AddressType::Account);
+        assert_eq!(parsed, address);
+    }
+}
+```
+
+`AddressBytes::from_sc_address(&sc_address)` recovers the bytes and format from
+the XDR form, returning `None` for the variants that are not a 32-byte account
+or contract id (muxed account, claimable balance, liquidity pool).
+`AddressBytes::from_strkey` accepts `G...` and `C...` only: an `M...` strkey
+carries an id an `ScAddress::Account` cannot hold, so parse those with
+`MuxedAddress::from_strkey`. Both parsers validate the checksum, so a mangled
+string is refused rather than silently decoded.
 
 ## Fuzzing invocation argument types
 

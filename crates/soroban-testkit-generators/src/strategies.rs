@@ -16,10 +16,11 @@ pub use crate::storage_tier::{
     MixedTierTtlAllocation, StorageTierWithTtl,
 };
 
+use proptest::collection::SizeRange;
 use proptest::prelude::*;
 use soroban_sdk::xdr::{
-    AccountId, ContractId, Hash, Limits, PublicKey, ScAddress, ScMap, ScMapEntry, ScVal, ScVec,
-    Uint256, VecM, WriteXdr as _,
+    AccountId, ContractId, Hash, Limits, MuxedAccount, MuxedAccountMed25519, MuxedEd25519Account,
+    PublicKey, ScAddress, ScMap, ScMapEntry, ScVal, ScVec, Uint256, VecM, WriteXdr as _,
 };
 use soroban_sdk::{testutils::Address as _, Address, Env, IntoVal, Symbol, TryFromVal as _, Val};
 
@@ -120,6 +121,65 @@ impl AddressBytes {
         Address::try_from_val(env, &ScAddress::from(self))
             .expect("a 32-byte address is a valid ScAddress")
     }
+
+    /// The address as its wire form: an `ScAddress`, without an environment.
+    pub fn to_sc_address(self) -> ScAddress {
+        ScAddress::from(self)
+    }
+
+    /// The address as the strkey a test recognises: `G...` for an account,
+    /// `C...` for a contract id.
+    pub fn to_strkey(self) -> String {
+        match self.address_type {
+            AddressType::Account => {
+                format!("{}", stellar_strkey::ed25519::PublicKey(self.bytes))
+            }
+            AddressType::Contract => format!("{}", stellar_strkey::Contract(self.bytes)),
+        }
+    }
+
+    /// Parse a `G...` or `C...` strkey back into its bytes and format tag.
+    ///
+    /// Muxed (`M...`) strkeys carry a 64-bit id that an `ScAddress` cannot
+    /// hold, so they are refused here; use [`MuxedAddress::from_strkey`] for
+    /// those. Anything that is not a valid, checksummed address strkey is
+    /// refused as well.
+    pub fn from_strkey(strkey: &str) -> Option<Self> {
+        if let Ok(contract) = stellar_strkey::Contract::from_string(strkey) {
+            return Some(Self {
+                address_type: AddressType::Contract,
+                bytes: contract.0,
+            });
+        }
+        if let Ok(public_key) = stellar_strkey::ed25519::PublicKey::from_string(strkey) {
+            return Some(Self {
+                address_type: AddressType::Account,
+                bytes: public_key.0,
+            });
+        }
+        None
+    }
+
+    /// Recover the bytes and format of an account or contract `ScAddress`.
+    ///
+    /// The other XDR variants — a muxed account, a claimable balance, a
+    /// liquidity pool — are not a 32-byte account or contract id, so they have
+    /// no `AddressBytes` equivalent and yield `None`.
+    pub fn from_sc_address(sc_address: &ScAddress) -> Option<Self> {
+        match sc_address {
+            ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))) => {
+                Some(Self {
+                    address_type: AddressType::Account,
+                    bytes: *bytes,
+                })
+            }
+            ScAddress::Contract(ContractId(Hash(bytes))) => Some(Self {
+                address_type: AddressType::Contract,
+                bytes: *bytes,
+            }),
+            _ => None,
+        }
+    }
 }
 
 impl From<AddressBytes> for ScAddress {
@@ -162,6 +222,187 @@ pub fn address_of_type(address_type: AddressType) -> impl Strategy<Value = Addre
             bytes,
         }
     })
+}
+
+/// Generates a raw XDR [`ScAddress`]: an ed25519 account or a contract id.
+///
+/// The existing address strategies return an [`AddressBytes`], which is what a
+/// contract call takes. Low-level XDR work — decoding a ledger entry, comparing
+/// a value against `ScAddress::Account` and `ScAddress::Contract`, writing a
+/// parser for the two arms — needs the `ScAddress` itself, so this strategy
+/// yields the encoded form. Both arms shrink towards the zeroed 32-byte payload,
+/// so a failing account case minimises to the all-zero ed25519 key and a failing
+/// contract case to the zeroed hash.
+pub fn sc_address() -> impl Strategy<Value = ScAddress> {
+    prop_oneof![sc_account_address(), sc_contract_address()]
+}
+
+/// Generates an [`ScAddress::Account`] with an ed25519 public key.
+///
+/// The payload shrinks towards the all-zero key.
+pub fn sc_account_address() -> impl Strategy<Value = ScAddress> {
+    any::<[u8; 32]>().prop_map(|bytes| {
+        ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes))))
+    })
+}
+
+/// Generates an [`ScAddress::Contract`] with a 32-byte contract hash.
+///
+/// The hash shrinks towards zero, which is what makes a failing contract
+/// address report the smallest id that still reproduces it.
+pub fn sc_contract_address() -> impl Strategy<Value = ScAddress> {
+    any::<[u8; 32]>().prop_map(|bytes| ScAddress::Contract(ContractId(Hash(bytes))))
+}
+
+/// Generates an [`ScAddress::MuxedAccount`]: an ed25519 key and a 64-bit id.
+///
+/// The key and id shrink towards zero, so a failing muxed case reports the
+/// smallest key and id that still reproduce it.
+pub fn sc_muxed_account_address() -> impl Strategy<Value = ScAddress> {
+    (any::<[u8; 32]>(), any::<u64>()).prop_map(|(bytes, id)| {
+        ScAddress::MuxedAccount(MuxedEd25519Account {
+            id,
+            ed25519: Uint256(bytes),
+        })
+    })
+}
+
+/// Generates a vector of mixed [`ScAddress`] variants — account, contract and
+/// muxed account — with a length drawn from `len`.
+///
+/// ```text
+/// proptest! {
+///     #[test]
+///     fn a_decoder_handles_every_address_kind(addresses in sc_address_collection(0..=8)) {
+///         // addresses: Vec<ScAddress>, possibly empty
+///     }
+/// }
+/// ```
+pub fn sc_address_collection(len: impl Into<SizeRange>) -> impl Strategy<Value = Vec<ScAddress>> {
+    prop::collection::vec(
+        prop_oneof![
+            sc_account_address(),
+            sc_contract_address(),
+            sc_muxed_account_address()
+        ],
+        len,
+    )
+}
+
+/// Generates a muxed ed25519 account: an account address plus a 64-bit id.
+///
+/// Muxed addresses are a classic Stellar account concept (`M...` strkeys), not
+/// a Soroban `ScAddress` variant, so the id is not representable as a contract
+/// address. The strategy yields both parts together so a test can check that
+/// the id survives the strkey round trip and is dropped — or threaded through —
+/// when the value becomes an `ScAddress`. The key and the id both shrink
+/// towards zero.
+pub fn muxed_address() -> impl Strategy<Value = MuxedAddress> {
+    (any::<[u8; 32]>(), any::<u64>()).prop_map(|(ed25519, id)| MuxedAddress::new(ed25519, id))
+}
+
+/// A muxed ed25519 account: an ed25519 public key and a 64-bit multiplex id.
+///
+/// `to_strkey` renders the `M...` form, `account_strkey` the `G...` form of the
+/// same key, and `to_sc_address` the [`ScAddress::Account`] a Soroban contract
+/// sees. Shrinking is by component: the key towards zero, the id towards zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MuxedAddress {
+    ed25519: [u8; 32],
+    id: u64,
+}
+
+impl MuxedAddress {
+    /// Pair a public key with a muxed id.
+    pub fn new(ed25519: [u8; 32], id: u64) -> Self {
+        Self { ed25519, id }
+    }
+
+    /// The ed25519 public key behind the muxed address.
+    pub fn ed25519(&self) -> &[u8; 32] {
+        &self.ed25519
+    }
+
+    /// The 64-bit multiplex id.
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// The underlying account, without the multiplex id.
+    pub fn account(&self) -> AddressBytes {
+        AddressBytes {
+            address_type: AddressType::Account,
+            bytes: self.ed25519,
+        }
+    }
+
+    /// The underlying account as an XDR [`AccountId`].
+    pub fn account_id(&self) -> AccountId {
+        AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(self.ed25519)))
+    }
+
+    /// The XDR address that keeps both parts: [`ScAddress::MuxedAccount`].
+    pub fn to_sc_address(&self) -> ScAddress {
+        ScAddress::MuxedAccount(MuxedEd25519Account {
+            id: self.id,
+            ed25519: Uint256(self.ed25519),
+        })
+    }
+
+    /// The plain [`ScAddress::Account`] form, which drops the muxed id.
+    pub fn to_account_sc_address(&self) -> ScAddress {
+        ScAddress::Account(self.account_id())
+    }
+
+    /// Rebuild the underlying account as a host value owned by `env`.
+    pub fn to_address(&self, env: &Env) -> Address {
+        self.account().to_address(env)
+    }
+
+    /// The XDR muxed-account form, which does carry the id.
+    pub fn to_muxed_account(&self) -> MuxedAccount {
+        MuxedAccount::MuxedEd25519(MuxedAccountMed25519 {
+            id: self.id,
+            ed25519: Uint256(self.ed25519),
+        })
+    }
+
+    /// The `M...` strkey for this account and id.
+    pub fn to_strkey(&self) -> String {
+        format!(
+            "{}",
+            stellar_strkey::ed25519::MuxedAccount {
+                ed25519: self.ed25519,
+                id: self.id,
+            }
+        )
+    }
+
+    /// The `G...` strkey of the underlying account, without the id.
+    pub fn account_strkey(&self) -> String {
+        self.account().to_strkey()
+    }
+
+    /// Parse an `M...` strkey back into its key and id.
+    pub fn from_strkey(strkey: &str) -> Option<Self> {
+        let muxed = stellar_strkey::ed25519::MuxedAccount::from_string(strkey).ok()?;
+        Some(Self {
+            ed25519: muxed.ed25519,
+            id: muxed.id,
+        })
+    }
+}
+
+impl From<MuxedAddress> for ScAddress {
+    fn from(muxed: MuxedAddress) -> Self {
+        muxed.to_sc_address()
+    }
+}
+
+impl From<MuxedAddress> for MuxedAccount {
+    fn from(muxed: MuxedAddress) -> Self {
+        muxed.to_muxed_account()
+    }
 }
 
 pub fn token_amount() -> impl Strategy<Value = i128> {
@@ -587,5 +828,241 @@ mod object_fuzz_tests {
             ),
             other => panic!("expected a shrunk counterexample, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod sc_address_tests {
+    use super::{
+        muxed_address, sc_account_address, sc_address, sc_address_collection, sc_contract_address,
+        sc_muxed_account_address, AddressBytes, AddressType, MuxedAddress,
+    };
+    use proptest::prelude::*;
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    use soroban_sdk::xdr::{
+        AccountId, ContractId, Hash, MuxedAccount, PublicKey, ScAddress, Uint256,
+    };
+    use soroban_sdk::{Address, Env, TryFromVal as _};
+    use std::cell::Cell;
+
+    /// Drive proptest's shrinker by hand: keep simplifying while `fails` holds.
+    fn minimise<T: Strategy>(strategy: T, fails: impl Fn(&T::Value) -> bool) -> T::Value
+    where
+        T::Value: Clone,
+    {
+        let mut runner = TestRunner::deterministic();
+        let mut tree = loop {
+            let tree = strategy.new_tree(&mut runner).unwrap();
+            if fails(&tree.current()) {
+                break tree;
+            }
+        };
+        let mut smallest = tree.current();
+        loop {
+            if fails(&tree.current()) {
+                smallest = tree.current();
+                if !tree.simplify() {
+                    break;
+                }
+            } else if !tree.complicate() {
+                break;
+            }
+        }
+        smallest
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn a_generated_sc_address_is_a_well_formed_variant(address in sc_address()) {
+            match address {
+                ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))) => {
+                    prop_assert_eq!(bytes.len(), 32);
+                }
+                ScAddress::Contract(ContractId(Hash(bytes))) => {
+                    prop_assert_eq!(bytes.len(), 32);
+                }
+                other => prop_assert!(false, "unexpected ScAddress variant: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_muxed_sc_address_carries_its_key_and_id(
+            address in sc_muxed_account_address(),
+        ) {
+            let ScAddress::MuxedAccount(muxed) = address else {
+                return Err(TestCaseError::fail("expected a muxed account address"));
+            };
+            prop_assert_eq!(muxed.ed25519.0.len(), 32);
+        }
+
+        #[test]
+        fn the_two_arms_only_yield_their_own_variant(
+            account in sc_account_address(),
+            contract in sc_contract_address(),
+        ) {
+            prop_assert!(matches!(account, ScAddress::Account(_)));
+            prop_assert!(matches!(contract, ScAddress::Contract(_)));
+        }
+    }
+
+    #[test]
+    fn an_sc_address_round_trips_through_the_host_address_and_its_strkey() {
+        let env = Env::default();
+        let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
+        runner
+            .run(&sc_address(), |sc_address| {
+                let host = Address::try_from_val(&env, &sc_address)
+                    .expect("a generated ScAddress is a host address");
+                let bytes = AddressBytes::from_sc_address(&sc_address)
+                    .expect("a generated address has a 32-byte payload");
+                let strkey = bytes.to_strkey();
+                let parsed =
+                    AddressBytes::from_strkey(&strkey).expect("a generated address strkey parses");
+
+                prop_assert_eq!(parsed, bytes);
+                prop_assert_eq!(ScAddress::from(host), sc_address);
+                Ok(())
+            })
+            .expect("every generated address round trips");
+    }
+
+    #[test]
+    fn an_account_strkey_and_a_contract_strkey_are_told_apart() {
+        let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
+        runner
+            .run(
+                &(
+                    super::account_address(),
+                    super::contract_address(),
+                    super::address_of_type(AddressType::Account),
+                ),
+                |(account, contract, filtered)| {
+                    prop_assert!(account.to_strkey().starts_with('G'));
+                    prop_assert!(contract.to_strkey().starts_with('C'));
+
+                    let parsed = AddressBytes::from_strkey(&account.to_strkey())
+                        .expect("an account strkey parses");
+                    prop_assert_eq!(parsed.address_type(), AddressType::Account);
+                    prop_assert_eq!(parsed.as_bytes(), account.as_bytes());
+
+                    prop_assert_eq!(
+                        AddressBytes::from_sc_address(&filtered.to_sc_address())
+                            .map(|bytes| bytes.address_type()),
+                        Some(AddressType::Account)
+                    );
+                    prop_assert!(AddressBytes::from_strkey("not a strkey").is_none());
+                    Ok(())
+                },
+            )
+            .expect("every generated address keeps its format");
+    }
+
+    #[test]
+    fn a_contract_sc_address_shrinks_to_the_zeroed_hash() {
+        let smallest = minimise(sc_contract_address(), |address| match address {
+            ScAddress::Contract(ContractId(Hash(hash))) => hash[0] >= 0x10,
+            _ => false,
+        });
+
+        let ScAddress::Contract(ContractId(Hash(hash))) = smallest else {
+            panic!("the failing case must stay a contract address");
+        };
+        assert_eq!(hash[0], 0x10);
+        assert!(hash[1..].iter().all(|byte| *byte == 0), "{hash:?}");
+    }
+
+    #[test]
+    fn an_account_sc_address_shrinks_to_the_zeroed_key() {
+        let smallest = minimise(sc_account_address(), |address| match address {
+            ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))) => {
+                bytes[0] >= 0x10
+            }
+            _ => false,
+        });
+
+        let ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(bytes)))) =
+            smallest
+        else {
+            panic!("the failing case must stay an account address");
+        };
+        assert_eq!(bytes[0], 0x10);
+        assert!(bytes[1..].iter().all(|byte| *byte == 0), "{bytes:?}");
+    }
+
+    #[test]
+    fn a_muxed_address_round_trips_through_its_strkey() {
+        let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
+        runner
+            .run(&muxed_address(), |muxed| {
+                let strkey = muxed.to_strkey();
+                prop_assert!(strkey.starts_with('M'));
+                prop_assert_eq!(MuxedAddress::from_strkey(&strkey), Some(muxed));
+
+                // The id is not part of the account form, so the M and G
+                // strkeys describe the same key but not the same value.
+                prop_assert!(muxed.account_strkey().starts_with('G'));
+                prop_assert!(MuxedAddress::from_strkey(&muxed.account_strkey()).is_none());
+                prop_assert_eq!(muxed.account().to_strkey(), muxed.account_strkey());
+
+                // The muxed form keeps the id; the plain account form drops it.
+                let ScAddress::MuxedAccount(encoded) = muxed.to_sc_address() else {
+                    prop_assert!(false, "a muxed address encodes as a muxed ScAddress");
+                    return Ok(());
+                };
+                prop_assert_eq!(encoded.id, muxed.id());
+                prop_assert_eq!(encoded.ed25519.0, *muxed.ed25519());
+                prop_assert_eq!(
+                    muxed.to_account_sc_address(),
+                    ScAddress::Account(muxed.account_id())
+                );
+
+                let MuxedAccount::MuxedEd25519(inner) = muxed.to_muxed_account() else {
+                    prop_assert!(false, "a generated muxed address must encode as muxed");
+                    return Ok(());
+                };
+
+                prop_assert_eq!(inner.id, muxed.id());
+                prop_assert_eq!(inner.ed25519.0, *muxed.ed25519());
+                Ok(())
+            })
+            .expect("every generated muxed address round trips");
+    }
+
+    #[test]
+    fn a_muxed_address_shrinks_its_key_and_id_towards_zero() {
+        let smallest = minimise(muxed_address(), |muxed| muxed.id() >= 7);
+
+        assert_eq!(smallest.id(), 7);
+        assert_eq!(*smallest.ed25519(), [0u8; 32]);
+        assert_eq!(smallest.account().address_type(), AddressType::Account);
+    }
+
+    #[test]
+    fn a_mixed_collection_holds_both_variants_and_respects_its_bounds() {
+        let accounts = Cell::new(0usize);
+        let contracts = Cell::new(0usize);
+
+        let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
+        runner
+            .run(&sc_address_collection(1..=6), |addresses| {
+                prop_assert!((1..=6).contains(&addresses.len()));
+                for address in &addresses {
+                    match address {
+                        ScAddress::Account(_) => accounts.set(accounts.get() + 1),
+                        ScAddress::Contract(_) => contracts.set(contracts.get() + 1),
+                        // Muxed accounts are in the mix too, but the two plain
+                        // kinds are what the collection has to cover.
+                        _ => {}
+                    }
+                }
+                Ok(())
+            })
+            .expect("every generated collection is well formed");
+
+        assert!(accounts.get() > 0, "no account address was generated");
+        assert!(contracts.get() > 0, "no contract address was generated");
     }
 }
