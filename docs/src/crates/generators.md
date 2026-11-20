@@ -5,7 +5,7 @@ Soroban-aware property-testing strategies for `proptest`, so generated inputs re
 <div class="tk-spec">
   <div class="tk-spec__item"><span class="tk-spec__key">Package</span><span class="tk-spec__value">soroban-testkit-generators</span></div>
   <div class="tk-spec__item"><span class="tk-spec__key">Features</span><span class="tk-spec__value">proptest (default)</span></div>
-  <div class="tk-spec__item"><span class="tk-spec__key">Modules</span><span class="tk-spec__value">strategies · errors · tuples · ttl · storage_tier · cost_model</span></div>
+  <div class="tk-spec__item"><span class="tk-spec__key">Modules</span><span class="tk-spec__value">strategies · contract_struct · errors · tuples · ttl · storage_tier · cost_model</span></div>
 </div>
 
 ## Available strategies
@@ -207,7 +207,6 @@ strategy is re-exported from the crate root:
 ```rust
 use proptest::prelude::*;
 use soroban_sdk::{BytesN, Env};
-use soroban_testkit_generators::strategies::{account_address, token_amount};
 use soroban_testkit_generators::{byte_array_32, byte_array_64, soroban_tuple_2};
 
 proptest! {
@@ -229,6 +228,105 @@ proptest! {
         let env = Env::default();
         let digest = BytesN::from_array(&env, &digest);
         let signature = BytesN::from_array(&env, &signature);
+## Contract structs and enums
+
+A `#[contracttype]` tree is where hand-written strategies get repetitive: a
+tuple of field strategies and a `prop_map` into the struct, once per struct,
+with every child struct needing its own copy of the same boilerplate. The
+`prop_contract_struct!` and `prop_contract_enum!` declarative macros generate
+that strategy from the field list, so the struct stays the source of truth — add
+a field and the macro stops compiling until it names a strategy for it.
+
+```rust
+use proptest::prelude::*;
+use soroban_sdk::{contracttype, Env, Vec};
+use soroban_testkit_generators::prop_contract_struct;
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Dimensions {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineItem {
+    pub quantity: u32,
+    pub unit_price: i128,
+    pub dimensions: Dimensions,
+}
+
+prop_contract_struct! {
+    pub Dimensions as dimensions(env) {
+        width: 0u32..=4_096u32,
+        height: 0u32..=4_096u32,
+    }
+}
+
+prop_contract_struct! {
+    pub LineItem as line_item(env) {
+        quantity: 0u32..=1_000u32,
+        unit_price: token_amount(),
+        dimensions: dimensions(env),
+    }
+}
+
+// A struct strategy composes like any other, including into an SDK vector.
+fn items(env: &Env) -> impl Strategy<Value = Vec<LineItem>> {
+    proptest::collection::vec(line_item(env), 0..=4).prop_map({
+        let env = env.clone();
+        move |items| {
+            let mut vec = Vec::new(&env);
+            for item in items {
+                vec.push_back(item);
+            }
+            vec
+        }
+    })
+}
+```
+
+The syntax is `Type as strategy_name(env) { field: strategy, .. }`, where every
+field of the struct must appear exactly once and the identifier in parentheses
+names the environment parameter the field strategies refer to. Visibility and
+doc comments on the generated function come from the attributes and visibility
+before the type name. Field strategies are ordinary proptest strategies, so an
+`Option<T>` field is `proptest::option::of(child(env))`, an SDK `Vec` or `Map`
+field is a `proptest::collection` strategy converted with the environment, and
+an enum field is `prop_oneof!` or a strategy from the macro below.
+
+An enum is generated from its variants. A variant written `Name: strategy` is
+constructed from that strategy's value, and a bare `Name` is a unit variant:
+
+```rust
+use soroban_testkit_generators::prop_contract_enum;
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Surcharge {
+    Percent(u32),
+    None,
+}
+
+prop_contract_enum! {
+    pub Surcharge as surcharge(env) {
+        Percent: 0u32..=10_000u32,
+        None,
+    }
+}
+```
+
+Both macros are re-exported at the crate root (a `#[macro_export]` macro lives
+there, not in the module named after it), while the module
+`soroban_testkit_generators::contract_struct` holds the `Env`, `Strategy` and
+`Just` re-exports the generated code names.
+
+<div class="tk-callout">
+  <span class="tk-callout__title">Shrinking is recursive</span>
+  <p>The generated strategy is a tuple of field strategies followed by a <code>prop_map</code>, so proptest shrinks it exactly as it shrinks that tuple: one field at a time, each towards whatever its own strategy shrinks towards, and a nested contract struct recursively through its own fields. Integers and byte arrays go to zero, vectors drop elements before simplifying the ones that remain, <code>option::of</code> prefers <code>None</code> and <code>prop_oneof!</code> prefers its first variant, so a failing <code>Invoice</code> minimises to the smallest tree that still reproduces the bug.</p>
+</div>
+
 ## Entry TTLs and storage rent
 
 Every contract data entry has a *live-until* ledger — the last ledger it can
